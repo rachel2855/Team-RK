@@ -40,7 +40,7 @@
 
 enum { AL, AC, AR };
 typedef struct { float x, y, cycle, off, q; } Node;
-typedef struct { int a, b, horiz, art, closed, cnt; float len, limit, crash, ratio, ux, uy, works; } Edge;
+typedef struct { int a, b, horiz, art, closed, cnt; float len, limit, crash, ratio, ux, uy, works; int resp; float t0; } Edge;
 typedef struct { int on, edge, dst, type; float pos, v; } Car;
 typedef struct { char t[72]; float clk; Color c; } Feed;
 
@@ -60,6 +60,14 @@ static RenderTexture2D rt3;
 static int view3d, followCar = -1, drag3d;
 static float camYaw = .35f, camPitch = .75f, camDist = 75, userDist = 75, followDist = 16, cx3, cy3;
 static Vector3 camT, drops3[110];
+/* emergency services: ambulances run outside the car-following model, so they overtake without disturbing traffic */
+#define NAMB 3
+#define NHOSP 2
+typedef struct { int st, edge, dst, hosp, call, node; float pos, onScene; } Amb; /* st: 0 idle, 1 to scene, 2 on scene, 3 to hospital */
+static Amb amb[NAMB];
+static const int HN_[NHOSP] = {GC + 1, 2 * GC + 4}; /* hospital junctions: B2 and C5 */
+static int emgOn = 1, calls, respN, followAmb = -1;
+static float respSum, pathT[NN][NN];
 static float bh[GR - 1][GC - 1][4];
 static int bcol[GR - 1][GC - 1][4];
 static int paused, speedIdx, rain, greenWave, trips, lastDay;
@@ -115,8 +123,8 @@ static float SegD(Vector2 p, Vector2 a, Vector2 b) {
 /* ---------- network, routing, signals ---------- */
 static void AddRoad(int a, int b, int horiz, int art) {
   float len = Vector2Distance(NP(a), NP(b)), ux = (N[b].x - N[a].x) / len, uy = (N[b].y - N[a].y) / len;
-  E[nE] = (Edge){a, b, horiz, art, 0, 0, len, art ? V_ART : V_LOC, 0, 1, ux, uy, 0};
-  E[nE + 1] = (Edge){b, a, horiz, art, 0, 0, len, art ? V_ART : V_LOC, 0, 1, -ux, -uy, 0};
+  E[nE] = (Edge){a, b, horiz, art, 0, 0, len, art ? V_ART : V_LOC, 0, 1, ux, uy, 0, 0, 0};
+  E[nE + 1] = (Edge){b, a, horiz, art, 0, 0, len, art ? V_ART : V_LOC, 0, 1, -ux, -uy, 0, 0, 0};
   eid[a][b] = nE; eid[b][a] = nE + 1; nE += 2;
 }
 static void Route(void) { /* Floyd-Warshall on travel time; closed/crashed roads get heavy weights */
@@ -130,6 +138,7 @@ static void Route(void) { /* Floyd-Warshall on travel time; closed/crashed roads
   }
   for (int k = 0; k < NN; k++) for (int i = 0; i < NN; i++) for (int j = 0; j < NN; j++)
     if (d[i][k] + d[k][j] < d[i][j]) { d[i][j] = d[i][k] + d[k][j]; nxt[i][j] = nxt[i][k]; }
+  memcpy(pathT, d, sizeof pathT);
 }
 static int Sig(int n, int horiz) { /* 0 red, 1 green, 2 amber */
   float cy = N[n].cycle, t = fmodf(simT + N[n].off, cy), half = cy * .5f;
@@ -160,7 +169,7 @@ static void StartCrash(int e) {
   char a[8], b[8], t[72];
   if (E[e].crash > 0) { E[e].crash = 0; Route(); AddFeed("Crash cleared", C_GREEN); Toast("Crash cleared"); return; }
   if (E[e].closed) { Toast("That road is closed"); return; }
-  E[e].crash = 40; Route();
+  E[e].crash = 70; Route();
   NName(E[e].a, a); NName(E[e].b, b); snprintf(t, 72, "Crash on %s > %s", a, b);
   AddFeed(t, C_RED); Toast("Crash reported! Rerouting traffic");
 }
@@ -190,6 +199,54 @@ static void ClearIncidents(void) {
   for (int e = 0; e < nE; e++) E[e].crash = E[e].works = 0;
   Route(); AddFeed("All crashes and roadworks cleared", C_GREEN); Toast("All incidents cleared");
 }
+static void Dispatch(void) { /* nearest free unit by travel time (all-pairs times from Route) */
+  for (int e = 0; e < nE; e++) {
+    int best = -1; float bt = 1e8f;
+    if (E[e].crash <= 0) { E[e].resp = 0; continue; }
+    if (E[e].resp == 0) { /* classify the crash once: 60% serious (needs an ambulance), 40% minor */
+      E[e].t0 = clockS;
+      if (rnd() < .6f) { E[e].resp = 1; calls++; } else { E[e].resp = 3; E[e].crash = fminf(E[e].crash, 30); }
+    }
+    if (E[e].resp != 1 || !emgOn) continue;
+    for (int k = 0; k < NAMB; k++) if (amb[k].st == 0 && pathT[amb[k].node][E[e].a] < bt) { bt = pathT[amb[k].node][E[e].a]; best = k; }
+    if (best < 0) continue;
+    { Amb *a = &amb[best]; int nn = a->node == E[e].a ? -1 : nxt[a->node][E[e].a];
+      if (nn < 0 && a->node != E[e].a) continue;
+      a->call = e; a->dst = E[e].a; E[e].resp = 2; a->pos = 0;
+      if (nn < 0) { a->st = 2; a->onScene = 10; E[e].crash = fminf(E[e].crash, 10); respSum += clockS - E[e].t0; respN++; }
+      else { a->st = 1; a->edge = eid[a->node][nn]; } }
+  }
+}
+static void AmbStep(float dt) {
+  for (int k = 0; k < NAMB; k++) {
+    Amb *a = &amb[k];
+    if (a->st == 1 && E[a->call].crash <= 0) { /* call cancelled: head for the nearest hospital */
+      int n = E[a->edge].b; float bt = 1e8f; a->st = 3;
+      for (int h = 0; h < NHOSP; h++) if (pathT[n][HN_[h]] < bt) { bt = pathT[n][HN_[h]]; a->dst = HN_[h]; }
+    }
+    if (a->st == 1 || a->st == 3) {
+      Edge *e = &E[a->edge]; float v = e->limit * (.6f + .65f * e->ratio) * (rain ? .85f : 1); /* weaves through queues */
+      a->pos += v * PXK * dt;
+      if (a->pos >= e->len) {
+        int n = e->b, nn = n == a->dst ? -1 : nxt[n][a->dst];
+        if (nn >= 0) { a->edge = eid[n][nn]; a->pos -= e->len; }
+        else {
+          a->node = n; a->pos = 0;
+          if (a->st == 1) { a->st = 2; a->onScene = 10; E[a->call].crash = fminf(E[a->call].crash, 10); respSum += clockS - E[a->call].t0; respN++; }
+          else { a->st = 0; for (int h = 0; h < NHOSP; h++) if (HN_[h] == n) a->hosp = h; }
+        }
+      }
+    } else if (a->st == 2) {
+      a->onScene -= dt;
+      if (a->onScene <= 0) {
+        float bt = 1e8f; int nn; a->st = 3;
+        for (int h = 0; h < NHOSP; h++) if (pathT[a->node][HN_[h]] < bt) { bt = pathT[a->node][HN_[h]]; a->dst = HN_[h]; }
+        nn = a->node == a->dst ? -1 : nxt[a->node][a->dst];
+        if (nn >= 0) { a->edge = eid[a->node][nn]; a->pos = 0; } else a->st = 0;
+      }
+    }
+  }
+}
 static void SimStep(float dt) {
   float h, demand, rs[NE] = {0}, qraw[NN] = {0}, sumV = 0, sumDelay = 0, sumG = 0, dtc = dt * CLOCKX; int rc[NE] = {0}, cnt = 0;
   simT += dt; clockS += dtc; if (stadiumT > 0) stadiumT -= dt;
@@ -202,6 +259,7 @@ static void SimStep(float dt) {
     E[e].works -= dt; E[e + 1].works = E[e].works;
     if (E[e].works <= 0) { E[e].works = E[e + 1].works = 0; Route(); AddFeed("Roadworks finished, full speed restored", C_GREEN); }
   }
+  Dispatch(); AmbStep(dt);
   h = fmodf(clockS / 3600, 24);
   demand = 2.0f * (.22f + G(h, 8, 1.3f) + .9f * G(h, 17.5f, 1.5f) + .3f * G(h, 13, 2.5f)) * (rain ? 1.08f : 1) * (stadiumT > 0 ? 1.7f : 1);
   spawnAcc += demand * dt; while (spawnAcc >= 1) { spawnAcc -= 1; Spawn(); }
@@ -335,6 +393,21 @@ static void DrawMap(int hn, int he) {
     Color c = Mix(C_PINK, C_CYAN, cars[i].v / e->limit); float rad = cars[i].type == 2 ? 3.8f : cars[i].type == 1 ? 3.0f : 2.4f;
     DrawCircleV(p, rad * 2.3f, Fade(c, .12f)); DrawCircleV(p, rad, c);
   }
+  for (int h = 0; h < NHOSP; h++) { /* hospitals */
+    Vector2 p = NP(HN_[h]);
+    RR((Rectangle){p.x - 32, p.y - 32, 20, 20}, 5, (Color){235, 240, 252, 255});
+    DrawRectangle((int)p.x - 24, (int)p.y - 28, 4, 12, C_RED); DrawRectangle((int)p.x - 28, (int)p.y - 24, 12, 4, C_RED);
+  }
+  for (int k = 0; k < NAMB; k++) { /* ambulances */
+    Amb *a = &amb[k]; Vector2 q; Color f = sinf((float)GetTime() * 14 + k) > 0 ? C_RED : C_CYAN; float ph = fmodf((float)GetTime() * 14, 10);
+    if (a->st == 1 || a->st == 3) {
+      Edge *e = &E[a->edge]; Vector2 sv = NP(e->a);
+      q = (Vector2){sv.x + e->ux * a->pos - e->uy * 3.6f, sv.y + e->uy * a->pos + e->ux * 3.6f};
+      DrawRing(q, 6 + ph, 7 + ph, 0, 360, 24, Fade(f, .35f));
+    } else { Vector2 b = NP(a->node); q = (Vector2){b.x + 16 + k * 8, b.y + 14}; }
+    if (a->st) DrawCircleV(q, 8, Fade(f, .28f));
+    DrawCircleV(q, 4.2f, WHITE); DrawCircleV(q, 1.6f, f);
+  }
   { Vector2 sp = NP(GC + 4); float pu = .5f + .5f * sinf((float)GetTime() * 4);
     if (stadiumT > 0) {
       float rem = stadiumT * CLOCKX, endc = fmodf(clockS + rem, 86400), w; char l2[48];
@@ -376,8 +449,8 @@ static void DrawEvents(void) {
     PushEv(ev, &n, &over, C_VIOLET, "Stadium event at B5", d, stadiumT / 90.0f);
   }
   for (int e = 0; e < nE; e++) if (E[e].crash > 0) {
-    NName(E[e].a, a); NName(E[e].b, b); snprintf(t, 40, "Crash on %s > %s", a, b); snprintf(d, 40, "clears in %d min", (int)ceilf(E[e].crash * CLOCKX / 60));
-    PushEv(ev, &n, &over, C_RED, t, d, E[e].crash / 40.0f);
+    NName(E[e].a, a); NName(E[e].b, b); snprintf(t, 40, "Crash on %s > %s", a, b); snprintf(d, 40, "%sclears in %d min", E[e].resp == 3 ? "minor, " : "", (int)ceilf(E[e].crash * CLOCKX / 60));
+    PushEv(ev, &n, &over, C_RED, t, d, E[e].crash / 70.0f);
   }
   for (int e = 0; e < nE; e += 2) if (E[e].works > 0) {
     NName(E[e].a, a); NName(E[e].b, b); snprintf(t, 40, "Roadworks %s - %s", a, b); snprintf(d, 40, "%d min left", (int)ceilf(E[e].works * CLOCKX / 60));
@@ -416,14 +489,32 @@ static void DrawHot(void) {
   }
 }
 
-static void DrawFeed(void) {
-  Rectangle r = R_FEED; char b[16];
-  Card(r, C_BORDER); Txt("INCIDENTS & EVENTS", r.x + 24, r.y + 18, 12, C_MUTED, 1, AL);
-  for (int i = 0; i < NFEED; i++) if (feed[i].t[0]) {
-    float y = r.y + 44 + i * 21; float a = 1 - i * .15f;
-    snprintf(b, 16, "%02d:%02d", (int)(fmodf(feed[i].clk, 86400) / 3600), (int)(fmodf(feed[i].clk, 3600) / 60));
-    Txt(b, r.x + 24, y, 12, Fade(C_MUTED, a), 0, AL); DrawCircleV((Vector2){r.x + 80, y + 8}, 3.5f, Fade(feed[i].c, a)); Txt(feed[i].t, r.x + 94, y - 1, 13, Fade(C_TEXT, a), 0, AL);
+static void DrawEmerg(void) {
+  Rectangle r = R_FEED; char b[64], c[64], n1[8], n2[8], v[3][24]; int busy = 0, waiting = 0;
+  static const char *ST[4] = {"Available", "En route", "On scene", "To hospital"}, *L[3] = {"AVG RESPONSE", "CALLS", "WAITING"};
+  Color SC[4] = {C_GREEN, C_AMBER, C_RED, C_CYAN}; float xs[3] = {r.x + 24, r.x + 160, r.x + 260};
+  for (int k = 0; k < NAMB; k++) if (amb[k].st) busy++;
+  for (int e = 0; e < nE; e++) if (E[e].resp == 1 && E[e].crash > 0 && emgOn) waiting++;
+  Card(r, C_BORDER); Txt("EMERGENCY SERVICES", r.x + 24, r.y + 18, 12, C_MUTED, 1, AL);
+  if (emgOn) snprintf(b, 64, "%d of %d units busy", busy, NAMB); else snprintf(b, 64, "RESPONSE OFF (press E)");
+  Txt(b, r.x + r.width - 24, r.y + 18, 12, emgOn ? C_GREEN : C_AMBER, 1, AR);
+  for (int k = 0; k < NAMB; k++) {
+    Amb *a = &amb[k]; float y = r.y + 40 + k * 23; c[0] = 0;
+    RR((Rectangle){r.x + 24, y + 1, 4, 15}, 2, SC[a->st]);
+    snprintf(b, 64, "Unit %d", k + 1); Txt(b, r.x + 38, y, 13, C_TEXT, 1, AL); Txt(ST[a->st], r.x + 100, y + 1, 12, SC[a->st], 0, AL);
+    if (a->st == 1 || a->st == 3) {
+      Edge *e = &E[a->edge]; int n = e->b, hi = 0;
+      float rem = (e->len - a->pos) / (e->limit * PXK) + (n == a->dst ? 0 : pathT[n][a->dst] / PXK); int mins = (int)ceilf(rem / 1.1f * CLOCKX / 60);
+      for (int h = 0; h < NHOSP; h++) if (HN_[h] == a->dst) hi = h;
+      if (a->st == 1) { NName(E[a->call].a, n1); NName(E[a->call].b, n2); snprintf(c, 64, "crash %s > %s, ETA %d min", n1, n2, mins); }
+      else snprintf(c, 64, "hospital %d, ETA %d min", hi + 1, mins);
+    } else if (a->st == 2) snprintf(c, 64, "treating, %d min left", (int)ceilf(a->onScene * CLOCKX / 60));
+    else snprintf(c, 64, "at hospital %d", a->hosp + 1);
+    Txt(c, r.x + r.width - 24, y + 1, 12, C_MUTED, 0, AR);
   }
+  if (respN) snprintf(v[0], 24, "%.1f min", respSum / respN / 60); else snprintf(v[0], 24, "--");
+  snprintf(v[1], 24, "%d", calls); snprintf(v[2], 24, "%d", waiting);
+  for (int i = 0; i < 3; i++) { Txt(L[i], xs[i], r.y + 114, 10, C_MUTED, 1, AL); Txt(v[i], xs[i], r.y + 127, 14, C_TEXT, 1, AL); }
 }
 
 static void DrawOverlay(void) {
@@ -444,15 +535,27 @@ static void DrawOverlay(void) {
 /* ---------- 3D view ---------- */
 static Vector3 W3(float px, float py, float y) { return (Vector3){(px - cx3) / 10.0f, y, (py - cy3) / 10.0f}; }
 
-static void UpdateCam3D(float dt) {
+static int IsHospBlock(int r, int c) { for (int h = 0; h < NHOSP; h++) if (HN_[h] / GC == r && HN_[h] % GC == c) return 1; return 0; }
+static int FollowPt(Vector3 *cp, float *ty) { /* follow target: an ambulance on the move, else a car */
+  if (followAmb >= 0) {
+    Amb *a = &amb[followAmb];
+    if (a->st == 1 || a->st == 3) { Edge *e = &E[a->edge]; Vector2 q = NP(e->a); *cp = W3(q.x + e->ux * a->pos, q.y + e->uy * a->pos, .3f); *ty = atan2f(-e->ux, -e->uy); return 1; }
+    followAmb = -1;
+  }
   if (followCar >= 0 && !cars[followCar].on) {
     int old = followCar; followCar = -1;
     for (int k = 0; k < 60; k++) { int c = GetRandomValue(0, NCAR - 1); if (cars[c].on && c != old) { followCar = c; break; } }
   }
   if (followCar >= 0) {
-    Car *c = &cars[followCar]; Edge *e = &E[c->edge]; Vector2 a = NP(e->a);
-    Vector3 cp = W3(a.x + e->ux * c->pos, a.y + e->uy * c->pos, .3f);
-    float dy = atan2f(-e->ux, -e->uy) - camYaw;
+    Car *c = &cars[followCar]; Edge *e = &E[c->edge]; Vector2 q = NP(e->a);
+    *cp = W3(q.x + e->ux * c->pos, q.y + e->uy * c->pos, .3f); *ty = atan2f(-e->ux, -e->uy); return 1;
+  }
+  return 0;
+}
+static void UpdateCam3D(float dt) {
+  Vector3 cp; float ty;
+  if (FollowPt(&cp, &ty)) {
+    float dy = ty - camYaw;
     while (dy > PI) dy -= 2 * PI;
     while (dy < -PI) dy += 2 * PI;
     camT = Vector3Lerp(camT, cp, fminf(1, 8 * dt)); camYaw += dy * fminf(1, 1.8f * dt);
@@ -475,6 +578,8 @@ static void Render3D(void) {
     Vector3 m = W3((N[E[e].a].x + N[E[e].b].x) / 2, (N[E[e].a].y + N[E[e].b].y) / 2, .03f); float L = E[e].len / 10, w = E[e].art ? 1.7f : 1.2f;
     Color base = E[e].art ? C_ART : C_ROAD, rc = E[e].closed ? Mix(base, C_RED, .35f) : base;
     DrawCubeV(m, E[e].horiz ? (Vector3){L, .06f, w} : (Vector3){w, .06f, L}, rc);
+    if (E[e].art) for (float dd = -L / 2 + 1.6f; dd < L / 2 - 1.2f; dd += 1.4f)
+      DrawCubeV((Vector3){m.x + (E[e].horiz ? dd : 0), .066f, m.z + (E[e].horiz ? 0 : dd)}, E[e].horiz ? (Vector3){.6f, .012f, .08f} : (Vector3){.08f, .012f, .6f}, Fade(WHITE, .55f));
   }
   for (int i = 0; i < NN; i++) DrawCubeV(W3(N[i].x, N[i].y, .04f), (Vector3){1.9f, .07f, 1.9f}, (Color){36, 42, 70, 255});
   for (int e = 0; e < nE; e++) { /* congestion-coloured lanes */
@@ -487,7 +592,7 @@ static void Render3D(void) {
   for (int r = 0; r < GR - 1; r++) for (int c = 0; c < GC - 1; c++) { /* buildings */
     Node *n0 = &N[r * GC + c], *n3 = &N[(r + 1) * GC + c + 1];
     float bw = ((n3->x - n0->x) / 10 - 3.2f) / 2, bd = ((n3->y - n0->y) / 10 - 3.2f) / 2; Vector3 mc = W3((n0->x + n3->x) / 2, (n0->y + n3->y) / 2, 0);
-    if (r == 1 && c == 4) continue; /* stadium block */
+    if ((r == 1 && c == 4) || IsHospBlock(r, c)) continue; /* stadium / hospital blocks */
     for (int k = 0; k < 4; k++) {
       float h = bh[r][c][k]; Color col = BC[bcol[r][c][k]];
       Vector3 p = {mc.x + (k % 2 ? 1 : -1) * (bw / 2 + .2f), h / 2, mc.z + (k / 2 ? 1 : -1) * (bd / 2 + .2f)};
@@ -502,6 +607,13 @@ static void Render3D(void) {
     float dx = k % 2 ? 4.3f : -4.3f, dz = k / 2 ? 4.3f : -4.3f;
     DrawCubeV((Vector3){sc.x + dx, 2.6f, sc.z + dz}, (Vector3){.18f, 5.2f, .18f}, (Color){70, 76, 100, 255});
     DrawCubeV((Vector3){sc.x + dx, 5.3f, sc.z + dz}, (Vector3){.7f, .3f, .7f}, stadiumT > 0 ? WHITE : Mix(C_AMBER, WHITE, .3f));
+  }
+  for (int h = 0; h < NHOSP; h++) { /* hospitals */
+    Node *n0 = &N[HN_[h]], *n3 = &N[HN_[h] + GC + 1]; Vector3 mc = W3((n0->x + n3->x) / 2, (n0->y + n3->y) / 2, 0);
+    DrawCubeV((Vector3){mc.x, 1.6f, mc.z}, (Vector3){8.4f, 3.2f, 9.4f}, (Color){226, 232, 246, 255});
+    DrawCubeV((Vector3){mc.x, 3.25f, mc.z}, (Vector3){8.6f, .1f, 9.6f}, (Color){190, 200, 225, 255});
+    DrawCubeV((Vector3){mc.x, 3.35f, mc.z}, (Vector3){3.0f, .1f, .8f}, C_RED); DrawCubeV((Vector3){mc.x, 3.35f, mc.z}, (Vector3){.8f, .1f, 3.0f}, C_RED);
+    DrawCubeWiresV((Vector3){mc.x, 1.6f, mc.z}, (Vector3){8.4f, 3.2f, 9.4f}, Fade(C_CYAN, .3f));
   }
   for (int i = 0; i < NN; i++) { /* traffic lights */
     Color ch = SigCol(Sig(i, 1)), cv = SigCol(Sig(i, 0)); Vector3 p = W3(N[i].x, N[i].y, 0);
@@ -529,6 +641,15 @@ static void Render3D(void) {
     DrawCubeV(p, sz, c); DrawCubeV((Vector3){p.x, p.y + H / 2, p.z}, (Vector3){sz.x * .7f, .14f, sz.z * .7f}, Mix(c, BLACK, .45f));
     if (i == followCar) DrawCubeWiresV(p, (Vector3){sz.x + .3f, sz.y + .3f, sz.z + .3f}, WHITE);
   }
+  for (int k = 0; k < NAMB; k++) { /* ambulances */
+    Amb *a = &amb[k]; Vector2 q; int hz = 1; Color f = sinf(t * 14 + k) > 0 ? C_RED : C_CYAN; Vector3 p, sz;
+    if (a->st == 1 || a->st == 3) { Edge *e = &E[a->edge]; Vector2 sv = NP(e->a); q = (Vector2){sv.x + e->ux * a->pos - e->uy * 3.6f, sv.y + e->uy * a->pos + e->ux * 3.6f}; hz = e->horiz; }
+    else { Vector2 b = NP(a->node); q = (Vector2){b.x + 16 + k * 8, b.y + 14}; }
+    p = W3(q.x, q.y, .45f); sz = hz ? (Vector3){1.4f, .7f, .6f} : (Vector3){.6f, .7f, 1.4f};
+    DrawCubeV(p, sz, WHITE); DrawCubeV((Vector3){p.x, p.y + .12f, p.z}, hz ? (Vector3){1.42f, .16f, .62f} : (Vector3){.62f, .16f, 1.42f}, C_RED);
+    DrawCubeV((Vector3){p.x, p.y + .45f, p.z}, (Vector3){.35f, .2f, .35f}, f);
+    if (k == followAmb) DrawCubeWiresV(p, (Vector3){sz.x + .3f, sz.y + .3f, sz.z + .3f}, WHITE);
+  }
   for (int e = 0; e < nE; e += 2) if (E[e].works > 0) { /* translucent pass (drawn last) */
     Vector2 a = NP(E[e].a); Vector3 m = W3(a.x + E[e].ux * E[e].len / 2, a.y + E[e].uy * E[e].len / 2, .1f); float L = E[e].len / 10 - 3.6f;
     DrawCubeV(m, E[e].horiz ? (Vector3){L, .03f, 1.5f} : (Vector3){1.5f, .03f, L}, Fade(C_AMBER, .22f + .12f * pulse));
@@ -545,9 +666,10 @@ static void Render3D(void) {
 static void DrawMap3D(void) {
   Rectangle r = R_MAP;
   Card(r, C_BORDER); Txt("CITY DISTRICT", r.x + 24, r.y + 18, 12, C_MUTED, 1, AL);
-  Txt("drag: orbit   right-drag: pan   scroll: zoom   F: follow a car", r.x + r.width - 24, r.y + 18, 12, C_MUTED, 0, AR);
+  Txt("drag: orbit   shift+drag or arrow keys: pan   scroll: zoom   F: follow   0: reset", r.x + r.width - 24, r.y + 18, 12, C_MUTED, 0, AR);
   DrawTexturePro(rt3.texture, (Rectangle){0, 0, (float)rt3.texture.width, -(float)rt3.texture.height}, (Rectangle){r.x + 8, r.y + 44, r.width - 16, r.height - 52}, (Vector2){0, 0}, 0, WHITE);
-  if (followCar >= 0) { RR((Rectangle){r.x + 20, r.y + r.height - 44, 230, 26}, 13, (Color){28, 20, 58, 230}); Txt("Following a car - F to stop", r.x + 34, r.y + r.height - 39, 12, C_TEXT, 1, AL); }
+  { char l[64]; snprintf(l, 64, "Arterial %.0f km/h (wide, dashed)   Local %.0f km/h", V_ART, V_LOC); RR((Rectangle){r.x + 20, r.y + 52, TW(l, 12, 0) + 24, 24}, 12, (Color){14, 18, 34, 215}); Txt(l, r.x + 32, r.y + 57, 12, C_TEXT, 0, AL); }
+  if (followCar >= 0 || followAmb >= 0) { RR((Rectangle){r.x + 20, r.y + r.height - 44, 270, 26}, 13, (Color){28, 20, 58, 230}); Txt(followAmb >= 0 ? "Following an ambulance - F to stop" : "Following a car - F to stop", r.x + 34, r.y + r.height - 39, 12, C_TEXT, 1, AL); }
 }
 
 static void DrawViewToggle(void) {
@@ -586,6 +708,7 @@ int main(void) {
   for (int r = 0; r < GR; r++) for (int c = 0; c < GC - 1; c++) AddRoad(r * GC + c, r * GC + c + 1, 1, r == 1);
   for (int r = 0; r < GR - 1; r++) for (int c = 0; c < GC; c++) AddRoad(r * GC + c, (r + 1) * GC + c, 0, c == 2);
   SetWave(); Route();
+  for (int k = 0; k < NAMB; k++) { amb[k].hosp = k % NHOSP; amb[k].node = HN_[amb[k].hosp]; amb[k].call = -1; }
   cx3 = (N[0].x + N[GC - 1].x) / 2; cy3 = (N[0].y + N[NN - 1].y) / 2;
   rt3 = LoadRenderTexture(1528, 1028); SetTextureFilter(rt3.texture, TEXTURE_FILTER_BILINEAR);
   for (int r = 0; r < GR - 1; r++) for (int c = 0; c < GC - 1; c++) for (int k = 0; k < 4; k++) {
@@ -618,11 +741,15 @@ int main(void) {
     if (IsKeyPressed(KEY_C)) { if (he >= 0) StartCrash(E[he ^ 1].cnt > E[he].cnt ? he ^ 1 : he); else DoCrash(); }
     if (IsKeyPressed(KEY_W)) { if (he >= 0) StartWorks(he); else DoWorks(); }
     if (IsKeyPressed(KEY_X)) ClearIncidents();
+    if (IsKeyPressed(KEY_E)) { emgOn = !emgOn; Toast(emgOn ? "Emergency response ON" : "Emergency response OFF"); }
     if (IsKeyPressed(KEY_V)) view3d = !view3d;
     if (IsKeyPressed(KEY_F)) {
       view3d = 1;
-      if (followCar >= 0) followCar = -1;
-      else for (int k = 0; k < 60; k++) { int c = GetRandomValue(0, NCAR - 1); if (cars[c].on) { followCar = c; break; } }
+      if (followCar >= 0 || followAmb >= 0) followCar = followAmb = -1;
+      else {
+        for (int k = 0; k < NAMB; k++) if (amb[k].st == 1 || amb[k].st == 3) { followAmb = k; break; }
+        if (followAmb < 0) for (int k = 0; k < 60; k++) { int c = GetRandomValue(0, NCAR - 1); if (cars[c].on) { followCar = c; break; } }
+      }
     }
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
       for (int i = 0; i < 4; i++) if (Hover((Rectangle){696 + i * 94, 22, 86, 40})) { if (i == 0) DoCrash(); else if (i == 1) DoStadium(); else if (i == 2) DoRain(); else DoWorks(); }
@@ -638,10 +765,19 @@ int main(void) {
     }
     if (view3d) {
       Vector2 md = GetMouseDelta(); float sy = sinf(camYaw), cw = cosf(camYaw), kp = camDist * .0012f;
-      if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) drag3d = Hover(R_MAP) && !Hover((Rectangle){R_MAP.x + 132, R_MAP.y + 10, 96, 26});
-      if (!IsMouseButtonDown(MOUSE_LEFT_BUTTON) && !IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) drag3d = 0;
-      if (drag3d && IsMouseButtonDown(MOUSE_LEFT_BUTTON)) { camYaw -= md.x * .006f; camPitch = Clamp(camPitch + md.y * .006f, .12f, 1.45f); }
-      if (drag3d && IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) { camT.x += (-cw * md.x - sy * md.y) * kp; camT.z += (sy * md.x - cw * md.y) * kp; followCar = -1; }
+      int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT), anyBtn = IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsMouseButtonDown(MOUSE_RIGHT_BUTTON) || IsMouseButtonDown(MOUSE_MIDDLE_BUTTON);
+      float ps = camDist * .9f * dt;
+      if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || IsMouseButtonPressed(MOUSE_RIGHT_BUTTON) || IsMouseButtonPressed(MOUSE_MIDDLE_BUTTON)) drag3d = Hover(R_MAP) && !Hover((Rectangle){R_MAP.x + 132, R_MAP.y + 10, 96, 26});
+      if (!anyBtn) drag3d = 0;
+      if (drag3d && IsMouseButtonDown(MOUSE_LEFT_BUTTON) && !shift) { camYaw -= md.x * .006f; camPitch = Clamp(camPitch + md.y * .006f, .12f, 1.45f); }
+      if (drag3d && (IsMouseButtonDown(MOUSE_RIGHT_BUTTON) || IsMouseButtonDown(MOUSE_MIDDLE_BUTTON) || (shift && IsMouseButtonDown(MOUSE_LEFT_BUTTON)))) {
+        camT.x += (-cw * md.x - sy * md.y) * kp; camT.z += (sy * md.x - cw * md.y) * kp; followCar = followAmb = -1;
+      }
+      if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT)) {
+        float fx = ((IsKeyDown(KEY_UP) ? 1 : 0) - (IsKeyDown(KEY_DOWN) ? 1 : 0)) * ps, rx = ((IsKeyDown(KEY_RIGHT) ? 1 : 0) - (IsKeyDown(KEY_LEFT) ? 1 : 0)) * ps;
+        camT.x += -sy * fx + cw * rx; camT.z += -cw * fx - sy * rx; followCar = followAmb = -1;
+      }
+      if (IsKeyPressed(KEY_ZERO)) { camT = (Vector3){0, 0, 0}; camYaw = .35f; camPitch = .75f; userDist = 75; followCar = followAmb = -1; }
       if (Hover(R_MAP) && wh != 0) { if (followCar >= 0) followDist = Clamp(followDist * (1 - wh * .1f), 6, 60); else userDist = Clamp(userDist * (1 - wh * .1f), 12, 140); }
       UpdateCam3D(dt);
     }
@@ -656,8 +792,8 @@ int main(void) {
     DrawHeader();
     for (int i = 0; i < 5; i++) DrawKpi(i);
     if (view3d) DrawMap3D(); else DrawMap(hn, he);
-    DrawViewToggle(); DrawEvents(); DrawHot(); DrawFeed();
-    Txt("1 2 4  speed      C  crash      S  stadium      R  rain      W  roadworks      X  clear      G  green wave      P  pause      V  2D/3D      F  follow a car      (hover a road + C or W places it there)", SW / 2, 780, 12, C_MUTED, 0, AC);
+    DrawViewToggle(); DrawEvents(); DrawHot(); DrawEmerg();
+    Txt("1 2 4  speed      C  crash      S  stadium      R  rain      W  roadworks      X  clear      G  green wave      P  pause      E  ambulances      V  2D/3D      F  follow a car      (hover a road + C or W places it there)", SW / 2, 780, 12, C_MUTED, 0, AC);
     DrawOverlay();
     if (introT < .6f) DrawRectangle(0, 0, SW, SH, Fade(C_BG, 1 - introT / .6f));
     EndDrawing();
