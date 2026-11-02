@@ -53,7 +53,7 @@ enum { AL, AC, AR };
 enum { BT_HOME, BT_SHOP, BT_OFFICE, BT_SCHOOL, BT_IND, BT_STAD, BT_HOSP, BT_MARKET, BT_MILL, BT_FOUNT, BT_STATION };
 typedef struct { float x, y, cycle, off, q; int deg, maxcls, sig, on, lc; } Node;
 typedef struct { int a, b, horiz, cls, bridge, closed, cnt, resp; float len, limit, crash, ratio, ux, uy, works, t0, crowd; const char *nm; } Edge;
-typedef struct { int on, edge, dst, type, bd; float pos, v, br, div; } Car;
+typedef struct { int on, edge, dst, type, bd, purpose; float pos, v, br, div; } Car;
 typedef struct { char t[72]; float clk; Color c; } Feed;
 typedef struct { float x, y, w, d, h, fx, fy; int type, acc, gen, att, pg[7], col; } Bld;
 typedef struct { int e, dir; float t, wait, spd; Color c; } Ped;
@@ -111,7 +111,9 @@ static int nE, nBld, nTree, nLamp, nPed, eid[NN][NN], nxt[NN][NN], nxtOld[NN][NN
 static int paused, speedIdx, rain, trips, lastDay, emgOn = 1, calls, respN, fogMan, routeCause, divSig, selB = -1;
 static int view3d, followCar = -1, followAmb = -1, drag3d, camPreset, quality = 1, haveBase, lightsOn, lightsTot, barrierDown, trainDir = 1;
 static float simT, clockS = 6.5f * 3600, spawnAcc, stadiumT, marketT, refT, introT, toastT, fogL, trainY, barPos, sinceChange;
-static float kpiT[5], kpiD[5], kpiRef[5], delayRate, co2Rate, delayH, co2T, respSum, pathT[NN][NN];
+static float rerouteT; /* timer for periodic congestion-aware rerouting */
+static int routeQuiet; /* 1 during routine reroutes: no "diverted" highlights */
+static float purD[7], kpiT[5], kpiD[5], kpiRef[5], delayRate, co2Rate, delayH, co2T, respSum, pathT[NN][NN];
 static float emaDelay, emaSpeed, emaQueue, emaThr, baseDelay, baseSpeed, baseQueue, baseThr;
 static const char *toastMsg = "";
 static struct { int on; char a[64], b[64]; Vector2 p; Color c; } tip;
@@ -203,6 +205,7 @@ static void Route(void) { /* Floyd-Warshall on travel time; closures, crashes, r
   for (int e = 0; e < nE; e++) {
     float w = E[e].len / E[e].limit + NodePen(E[e].b);
     if (E[e].closed) w = 1e6f; else if (E[e].crash > 0) w *= 8; else if (E[e].works > 0) w *= 3; else if (E[e].crowd > 0) w *= 1.4f;
+    if (!E[e].closed) w *= 1 + 1.5f * fminf(1, E[e].cnt * 11.0f / E[e].len); /* congestion: how full the street is (short streets fill fast) */
     if (w < d[E[e].a][E[e].b]) { d[E[e].a][E[e].b] = w; nxt[E[e].a][E[e].b] = E[e].b; }
   }
   for (int k = 0; k < NN; k++) for (int i = 0; i < NN; i++) for (int j = 0; j < NN; j++)
@@ -216,7 +219,7 @@ static void Route(void) { /* Floyd-Warshall on travel time; closures, crashes, r
       if (o2 != n2) diff = 1;
       oa = o2; na = n2;
     }
-    if (diff) { c->div = 40; if (routeCause == 1) divSig++; }
+    if (diff && !routeQuiet) { c->div = 40; if (routeCause == 1) divSig++; }
   }
 }
 static int Sig(int n, int horiz) { /* 0 red, 1 green, 2 amber, 4 no signal (give-way) */
@@ -227,14 +230,24 @@ static int Sig(int n, int horiz) { /* 0 red, 1 green, 2 amber, 4 no signal (give
   if (horiz != hp) return 0;
   return rem < 1.2f ? 2 : 1;
 }
-static int Yield(int i, Edge *e, int n) { /* side streets give way to main roads; equal roads: nearest car first */
-  Car *c = &cars[i]; float rem = e->len - c->pos;
+static int Conflict(Edge *e, int ne, Edge *oe, int one) { /* do two movements through the same junction cross paths? ne/one = exit edges (-1: trip ends here) */
+  if (ne < 0 || one < 0) return 0;
+  if (one == ne) return 1; /* merging into the same street */
+  if (e->ux * oe->ux + e->uy * oe->uy < -.8f) /* oncoming: straight and right turns pass each other, only a left turn crosses */
+    return e->ux * E[ne].uy - e->uy * E[ne].ux < -.35f;
+  return 1; /* side-on approaches cross */
+}
+static int Yield(int i, Edge *e, int n) { /* side streets give way to main roads; equal roads: nearest car first; only to cars whose path crosses ours */
+  Car *c = &cars[i]; float rem = e->len - c->pos; int nn, ne;
   if (rem > 40) return 0;
+  nn = c->dst == n ? -1 : nxt[n][c->dst]; ne = nn >= 0 ? eid[n][nn] : -1;
   for (int j = 0; j < NCAR; j++) {
-    Car *o = &cars[j]; Edge *oe; float orem;
+    Car *o = &cars[j]; Edge *oe; float orem; int on, one;
     if (!o->on || j == i || o->edge == c->edge) continue;
     oe = &E[o->edge]; if (oe->b != n) continue;
     orem = oe->len - o->pos; if (orem > 45) continue;
+    on = o->dst == n ? -1 : nxt[n][o->dst]; one = on >= 0 ? eid[n][on] : -1;
+    if (!Conflict(e, ne, oe, one)) continue;
     if (oe->cls > e->cls || (oe->cls == e->cls && (orem + 5 < rem || (fabsf(orem - rem) <= 5 && j < i)))) return 1;
   }
   return 0;
@@ -310,7 +323,10 @@ static float TripRate(int k, float h) {
     case 5: return .5f * G(h, 15.4f, .45f);
     case 6: return .3f * (G(h, 10.5f, 1.6f) + .8f * G(h, 16, 1.8f));
     case 7: return .28f * (G(h, 12, 1.8f) + G(h, 17, 1.8f));
-    case 8: return stadiumT > 0 ? 1.0f : 0;
+    case 8: { /* stadium crowd: builds, peaks mid-event, tails off */
+      float f = 1.0f - stadiumT / 90.0f;       /* 0 at start, 1 at end */
+      return stadiumT > 0 ? .55f * sinf(PI * f) + .05f : 0;
+    }
     default: return marketT > 0 ? .7f : 0;
   }
 }
@@ -318,12 +334,14 @@ static void SpawnTrip(int k) {
   int ob = -1, db = -1, cO = 0, cD = 0, slot = -1, o, d, nn, e;
   for (int b = 0; b < nBld; b++) { if (bld[b].type == TR[k].from && rnd() * ++cO < 1) ob = b; if (bld[b].type == TR[k].to && rnd() * ++cD < 1) db = b; }
   if (ob < 0 || db < 0) return;
-  o = bld[ob].acc; d = bld[db].acc; if (o == d) return;
+  o = bld[ob].acc; d = bld[db].acc;
+  if (bld[db].type == BT_STAD && rnd() < .5f) d = 40; /* second stadium entrance (south side) */
+  if (o == d) return;
   nn = nxt[o][d]; if (nn < 0) return;
   e = eid[o][nn];
   for (int i = 0; i < NCAR; i++) { if (!cars[i].on) { if (slot < 0) slot = i; } else if (cars[i].edge == e && cars[i].pos < 14) return; }
   if (slot < 0) return;
-  { float r = rnd(); cars[slot] = (Car){.on = 1, .edge = e, .dst = d, .type = r < .08f ? 2 : r < .24f ? 1 : 0, .bd = db, .v = E[e].limit * .6f}; }
+  { float r = rnd(); cars[slot] = (Car){.on = 1, .edge = e, .dst = d, .type = r < .08f ? 2 : r < .24f ? 1 : 0, .bd = db, .purpose = TR[k].purpose, .v = E[e].limit * .6f}; }
   bld[ob].gen++; bld[db].att++; if (bld[ob].type == BT_HOME) bld[ob].pg[TR[k].purpose]++;
 }
 static int PickCrashEdge(void) { /* bridges and unsignalised junctions are more crash-prone */
@@ -464,7 +482,7 @@ static void PedStep(float dt) { /* pedestrians cross only while their road has a
   }
 }
 static void SimStep(float dt) {
-  float h, rs[NE] = {0}, qraw[NN] = {0}, sumV = 0, sumDelay = 0, sumG = 0, dtc = dt * CLOCKX, tot = 0, rt[10], sumQ = 0; int rc[NE] = {0}, cnt = 0, arr = 0;
+  float h, rs[NE] = {0}, qraw[NN] = {0}, sumV = 0, sumDelay = 0, sumG = 0, dtc = dt * CLOCKX, tot = 0, rt[10], sumQ = 0; int rc[NE] = {0}, pc[7] = {0}, cnt = 0, arr = 0;
   simT += dt; clockS += dtc; sinceChange += dt; if (stadiumT > 0) stadiumT -= dt; if (marketT > 0) marketT -= dt;
   { int dn = (int)(clockS / 86400); if (dn != lastDay) { lastDay = dn; delayH = co2T = 0; for (int b = 0; b < nBld; b++) { bld[b].gen = bld[b].att = 0; memset(bld[b].pg, 0, sizeof bld[b].pg); } AddFeed("New day: daily totals reset", C_CYAN); } }
   for (int e = 0; e < nE; e++) if (E[e].crash > 0) {
@@ -481,7 +499,7 @@ static void SimStep(float dt) {
   TrainStep(dt); PedStep(dt); Dispatch(); AmbStep(dt);
   if (rnd() < dt / 240.0f) DoCrash(); /* ambient crashes, more likely on bridges */
   for (int k = 0; k < 10; k++) { rt[k] = TripRate(k, h); tot += rt[k]; }
-  spawnAcc += tot * 1.4f * (rain ? 1.08f : 1) * dt;
+  spawnAcc += tot * 0.8f *(rain ? 1.08f : 1) * dt;
   while (spawnAcc >= 1) { float r = rnd() * tot; int k = 9; spawnAcc -= 1; for (int q = 0; q < 10; q++) { r -= rt[q]; if (r <= 0) { k = q; break; } } SpawnTrip(k); }
   for (int i = 0; i < NCAR; i++) {
     Car *c = &cars[i]; Edge *e; int n, nn = -1, ne = -1, atDst, blocked = 0, st = 1;
@@ -505,19 +523,21 @@ static void SimStep(float dt) {
     if (!atDst && st == 4 && N[n].deg >= 3 && sl < 45 && vmax > 25 && N[n].sig) vmax = 25; /* give-way junctions cut capacity */
     tg = fminf(vmax, 2.2f * fmaxf(0, gap - 4));
     c->br = tg < c->v - 2 ? 1.0f : 0;
-    c->v += Clamp(tg - c->v, -80 * dt, 25 * dt); if (c->v < 0) c->v = 0;
+    c->v += Clamp(tg - c->v, -80 * dt, 40 * dt); if (c->v < 0) c->v = 0;
     c->pos += c->v * PXK * dt;
     if (c->pos >= e->len) {
       if (atDst) { c->on = 0; trips++; arr++; continue; }
       if (!blocked) { c->pos -= e->len; c->edge = ne; e = &E[ne]; } else c->pos = e->len;
     }
     ratio = fminf(1, c->v / e->limit);
-    rs[c->edge] += ratio; rc[c->edge]++; cnt++;
+    rs[c->edge] += ratio; rc[c->edge]++; cnt++; pc[c->purpose]++;
     sumV += c->v; sumDelay += 1 - ratio; sumG += c->v < 5 ? .8f : .4f + .037f * c->v;
     if (c->v < 6 && e->len - c->pos < 50) qraw[e->b] += 1;
   }
   for (int e = 0; e < nE; e++) { E[e].ratio = Appr(E[e].ratio, rc[e] ? rs[e] / rc[e] : 1, 4, dt); E[e].cnt = rc[e]; }
+  rerouteT += dt; if (rerouteT >= 4) { rerouteT = 0; routeQuiet = 1; Route(); routeQuiet = 0; } /* drivers react to congestion every few seconds */
   for (int n = 0; n < NNODE; n++) { N[n].q = Appr(N[n].q, qraw[n], 3, dt); sumQ += N[n].q; }
+  for (int p = 0; p < 7; p++) purD[p] = Appr(purD[p], (float)pc[p], 1.5f, dt);
   delayH += sumDelay * dtc / 3600; co2T += sumG * dtc / 1e6f; delayRate = sumDelay; co2Rate = sumG * 3.6f;
   lightsOn = 0; for (int n = 0; n < NNODE; n++) if (N[n].sig && N[n].on) lightsOn++;
   kpiT[0] = (float)cnt; kpiT[1] = cnt ? sumV / cnt : 40; kpiT[2] = cnt ? sumDelay / cnt * 100 : 0; kpiT[3] = (float)lightsOn; kpiT[4] = co2T;
@@ -800,22 +820,26 @@ static void DrawEvents(void) {
     if (ev[i].frac >= 0) { RR((Rectangle){r.x + 38, y + 19, r.width - 62, 3}, 1.5f, Fade(WHITE, .07f)); RR((Rectangle){r.x + 38, y + 19, fmaxf(3, (r.width - 62) * ev[i].frac), 3}, 1.5f, ev[i].c); }
   }
 }
+static void DrawPurpose(void) { /* live trips by purpose: fixed rows, calm bars */
+  Rectangle r = R_HOT; static float scaleMax = 24; float mx = 0, tot = 0; char b[48];
+  static const char *NM[7] = {"Commuting to work", "Industry shifts", "School run", "Shopping", "Stadium crowd", "Market trips", "Heading home"};
+  static const char *TIP[7] = {"Home to offices. Peaks around 08:00", "Home to the industrial units (06:45, 15:00)", "Home to school. Peaks 08:30",
+                               "Home to the shops. Peaks 10:30, 16:00", "Supporters heading to the stadium (S)", "Shoppers heading to the market (M)", "Return trips: 17:30 rush, 15:20 school pick-up"};
+  Color PC[7] = {C_CYAN, (Color){150, 160, 190, 255}, C_GREEN, C_AMBER, C_VIOLET, C_PINK, (Color){110, 150, 255, 255}};
+  for (int i = 0; i < 7; i++) { mx = fmaxf(mx, purD[i]); tot += purD[i]; }
+  scaleMax = Appr(scaleMax, fmaxf(24, mx * 1.2f), .4f, GetFrameTime());
+  Card(r, C_BORDER); Txt("TRIPS RIGHT NOW", r.x + 24, r.y + 18, 12, C_MUTED, 1, AL);
+  snprintf(b, 48, "%.0f cars on trips", tot); Txt(b, r.x + r.width - 24, r.y + 18, 12, C_TEXT, 1, AR);
+  for (int i = 0; i < 7; i++) {
+    float y = r.y + 42 + i * 20, w = r.width - 220, bw = Clamp(purD[i] / scaleMax, 0, 1) * w; Rectangle row = {r.x + 12, y - 3, r.width - 24, 20};
+    if (Hover(row)) { RR(row, 6, Fade(WHITE, .04f)); SetTip(NM[i], TIP[i], GetMousePosition(), PC[i]); }
+    RR((Rectangle){r.x + 24, y + 2, 4, 12}, 2, PC[i]); Txt(NM[i], r.x + 38, y, 12, C_TEXT, 1, AL);
+    RR((Rectangle){r.x + 160, y + 4, w, 8}, 4, Fade(WHITE, .06f)); if (purD[i] > .3f) RR((Rectangle){r.x + 160, y + 4, fmaxf(4, bw), 8}, 4, PC[i]);
+    snprintf(b, 48, "%.0f", purD[i]); Txt(b, r.x + r.width - 24, y, 12, C_TEXT, 1, AR);
+  }
+}
 static void Glow(float x, float y, float rad, Color c, float peak) {
   for (int i = 0; i < 14; i++) DrawCircleV((Vector2){x, y}, rad * (1 - i / 14.0f), Fade(c, peak / 14));
-}
-
-static void DrawHot(void) {
-  Rectangle r = R_HOT; int idx[NN]; char b[48], nm[8]; float mq = 4;
-  Card(r, C_BORDER); Txt("JUNCTION QUEUES", r.x + 24, r.y + 18, 12, C_MUTED, 1, AL); Txt("cars waiting", r.x + r.width - 24, r.y + 18, 12, C_MUTED, 0, AR);
-  for (int i = 0; i < NN; i++) idx[i] = i;
-  for (int i = 0; i < 6; i++) for (int j = i + 1; j < NN; j++) if (N[idx[j]].q > N[idx[i]].q) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
-  for (int i = 0; i < 6; i++) mq = fmaxf(mq, N[idx[i]].q);
-  for (int i = 0; i < 6; i++) {
-    float y = r.y + 46 + i * 23, q = N[idx[i]].q, w = r.width - 140; Color c = Mix(C_GREEN, C_PINK, q / 9);
-    NName(idx[i], nm); Txt(nm, r.x + 24, y, 13, C_TEXT, 1, AL);
-    RR((Rectangle){r.x + 60, y + 4, w, 8}, 4, Fade(WHITE, .06f)); RR((Rectangle){r.x + 60, y + 4, fmaxf(8, w * q / (mq * 1.1f)), 8}, 4, c);
-    snprintf(b, 48, "%.0f", q); Txt(b, r.x + r.width - 24, y, 13, C_TEXT, 1, AR);
-  }
 }
 
 static void DrawEmerg(void) {
@@ -953,10 +977,12 @@ static void ShadowPoly(Vector2 *pt, int n, float y, Color k) { /* convex hull (g
   rlEnd();
 }
 static void ShadowBox(float cx, float cz, float fx, float fz, float L, float W, float h, Vector2 sh, Color k) {
-  Vector2 pt[8];
+  Vector2 pt[8], off = {sh.x * h, sh.y * h}; float ol = Vector2Length(off);
+  if (ol > .7f) off = Vector2Scale(off, .7f / ol); /* a short soft shade, not a long cast shadow */
+  if (ol < .05f) off = (Vector2){.05f, .03f};
   for (int i = 0; i < 4; i++) {
     float sf = (i & 1) ? 1 : -1, sr = (i & 2) ? 1 : -1, x = cx + fx * sf * L / 2 - fz * sr * W / 2, z = cz + fz * sf * L / 2 + fx * sr * W / 2;
-    pt[i] = (Vector2){x, z}; pt[i + 4] = (Vector2){x + sh.x * h, z + sh.y * h};
+    pt[i] = (Vector2){x, z}; pt[i + 4] = (Vector2){x + off.x, z + off.y};
   }
   ShadowPoly(pt, 8, .145f, k);
 }
@@ -1058,7 +1084,7 @@ static void Render3D(void) {
   Color sky = Mix(Mix((Color){9, 12, 28, 255}, (Color){112, 166, 222, 255}, Clamp(elev * 2.5f + .1f, 0, 1)), (Color){236, 132, 92, 255}, sd * .75f);
   Color grass = Mix((Color){26, 44, 36, 255}, (Color){52, 104, 66, 255}, lit), water = Mix((Color){18, 40, 80, 255}, (Color){52, 118, 186, 255}, lit);
   float pl[12][4] = {{0}}, plc[12][3] = {{0}}, fogDen; int np = 0, usedL[4] = {-1, -1, -1, -1}; Vector2 sh = {0, 0}; int shadows = quality && elev > .08f;
-  Color shk = {0, 0, 0, (unsigned char)(95 * Clamp(elev * 2, 0, 1))}; Vector3 cpos;
+  Color shk = {0, 0, 0, (unsigned char)(55 * Clamp(elev * 2, 0, 1))}; Vector3 cpos;
   if (rain) { sky = Mix(sky, (Color){80, 88, 104, 255}, .5f); sunC = Vector3Scale(sunC, .6f); }
   sky = Mix(sky, (Color){178, 184, 196, 255}, fogL * .85f);
   fogDen = .0035f + .0095f * fogL + (rain ? .0025f : 0);
@@ -1132,7 +1158,6 @@ static void Render3D(void) {
   if (shadows) { /* planar sun shadows */
     for (int b = 0; b < nBld; b++) { Bld *q = &bld[b]; Vector3 c = W3(q->x, q->y, 0); ShadowBox(c.x, c.z, q->fx, q->fy, q->w / 10, q->d / 10, q->h + (q->type == BT_HOME ? .9f : 0), sh, shk); }
     for (int i = 0; i < nTree; i++) { Vector3 c = W3(trees[i].x, trees[i].y, 0); ShadowBox(c.x, c.z, 1, 0, .9f, .9f, 1.8f * trees[i].z, sh, shk); }
-    for (int i = 0; i < NCAR; i++) if (cars[i].on) { float fx, fz; Vector3 c = CarWorld(&cars[i], &fx, &fz, 0); if (Vector3Distance(c, camT) < 45) ShadowBox(c.x, c.z, fx, fz, 1, .5f, .5f, sh, shk); }
   }
   for (int b = 0; b < nBld; b++) { /* buildings */
     static const Color HW[5] = {{214, 196, 170, 255}, {190, 170, 160, 255}, {200, 205, 185, 255}, {176, 186, 206, 255}, {222, 206, 160, 255}};
@@ -1425,7 +1450,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) DrawKpi(i);
     if (view3d) DrawMap3D(); else DrawMap2D(hn, hb);
     DrawViewToggle(); DrawInfo(); if (hov) MapTips(hn, he, hb);
-    DrawEvents(); DrawHot(); DrawEmerg();
+    DrawEvents(); DrawPurpose(); DrawEmerg();
     Txt("1 2 4 speed   C crash   S stadium   R rain   W works   M market   X clear   E ambulances   T all signals   L signals here   O fog   V 2D/3D   Tab camera   F chase   P pause", SW / 2, 780, 11, C_MUTED, 0, AC);
     DrawOverlay();
     if (introT < .6f) DrawRectangle(0, 0, SW, SH, Fade(C_BG, 1 - introT / .6f));
